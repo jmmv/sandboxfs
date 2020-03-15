@@ -16,7 +16,7 @@ extern crate fuse;
 extern crate time;
 
 use {create_as, IdGenerator};
-use failure::{Fallible, ResultExt};
+use failure::Fallible;
 use nix::{errno, fcntl, sys, unistd};
 use nix::dir as rawdir;
 use nodes::{
@@ -163,7 +163,7 @@ impl OpenDir {
                     (fs_type, Some(fs_attr))
                 },
             };
-            let child = cache.get_or_create(ids, &path, fs_type, fs_attr.as_ref(), self.writable);
+            let child = cache.get_or_create(ids, &path, fs_attr.as_ref(), self.writable);
 
             reply.push(ReplyEntry { inode: child.inode(), fs_type: fs_type, name: name.clone() });
 
@@ -442,8 +442,7 @@ impl Dir {
                 None => return Err(KernelError::from_errno(errno::Errno::ENOENT)),
             };
             let fs_attr = fs::symlink_metadata(&path)?;
-            let fs_type = conv::filetype_fs_to_fuse(&path, fs_attr.file_type());
-            let node = cache.get_or_create(ids, &path, fs_type, Some(&fs_attr), writable);
+            let node = cache.get_or_create(ids, &path, Some(&fs_attr), writable);
             let attr = conv::attr_fs_to_fuse(
                 path.as_path(), node.inode(), node.getattr()?.nlink, &fs_attr);
             (node, attr)
@@ -469,7 +468,7 @@ impl Dir {
     /// and we fail the lookup.  (This is an artifact of how we currently implement this function
     /// as this condition should just be impossible.)
     fn post_create_lookup(writable: bool, state: &mut MutableDir, path: &Path, name: &OsStr,
-        exp_type: fuse::FileType, ids: &IdGenerator, cache: &dyn Cache)
+        ids: &IdGenerator, cache: &dyn Cache)
         -> NodeResult<(ArcNode, fuse::FileAttr)> {
         debug_assert_eq!(path.file_name().unwrap(), name);
 
@@ -479,14 +478,7 @@ impl Dir {
         // we need to be able to synthesize the returned attr, which means we need to track ctimes
         // internally.
         match Dir::lookup_locked(writable, state, name, ids, cache) {
-            Ok((node, attr)) => {
-                if node.file_type_cached() != exp_type {
-                    warn!("Newly-created file {} was replaced or deleted before create finished",
-                        path.display());
-                    return Err(KernelError::from_errno(errno::Errno::EIO));
-                }
-                Ok((node, attr))
-            },
+            Ok((node, attr)) => Ok((node, attr)),
             Err(e) => {
                 if let Err(e) = fs::remove_file(&path) {
                     warn!("Failed to clean up newly-created {}: {}", path.display(), e);
@@ -532,8 +524,12 @@ impl Node for Dir {
     }
 
     fn file_type_cached(&self) -> fuse::FileType {
-        let state = self.state.lock().unwrap();
-        state.attr.unwrap().kind
+        let mut state = self.state.lock().unwrap();
+        let attr = match state.attr {
+            Some(attr) => attr,
+            None => Dir::getattr_locked(self.inode, &mut state).unwrap(),
+        };
+        attr.kind
     }
 
     fn delete(&self, cache: &dyn Cache) {
@@ -604,16 +600,11 @@ impl Node for Dir {
         if let Some(dirent) = state.children.get(name) {
             // TODO(jmmv): We should probably mark this dirent as an explicit mapping if it already
             // wasn't, but the Go variant of this code doesn't do this -- so investigate later.
-            ensure!(dirent.node.file_type_cached() == fuse::FileType::Directory
-                && !remainder.is_empty(), "Already mapped");
             return dirent.node.map(remainder, underlying_path, writable, ids, cache);
         }
 
         let child = if remainder.is_empty() {
-            let fs_attr = fs::symlink_metadata(underlying_path)
-                .context(format!("Stat failed for {:?}", underlying_path))?;
-            let fs_type = conv::filetype_fs_to_fuse(underlying_path, fs_attr.file_type());
-            cache.get_or_create(ids, underlying_path, fs_type, Some(&fs_attr), writable)
+            cache.get_or_create(ids, underlying_path, None, writable)
         } else {
             self.new_scaffold_child(state.underlying_path.as_ref(), name, ids, time::get_time())
         };
@@ -624,7 +615,6 @@ impl Node for Dir {
         if remainder.is_empty() {
             Ok(child)
         } else {
-            ensure!(child.file_type_cached() == fuse::FileType::Directory, "Already mapped");
             child.map(remainder, underlying_path, writable, ids, cache)
         }
     }
@@ -668,7 +658,7 @@ impl Node for Dir {
 
         let file = create_as(&path, uid, gid, |p| options.open(&p), |p| fs::remove_file(&p))?;
         let (node, attr) = Dir::post_create_lookup(self.writable, &mut state, &path, name,
-            fuse::FileType::RegularFile, ids, cache)?;
+            ids, cache)?;
         Ok((node.clone(), node.handle_from(file), attr))
     }
 
@@ -712,8 +702,7 @@ impl Node for Dir {
             &path, uid, gid,
             |p| fs::DirBuilder::new().mode(mode).create(&p),
             |p| fs::remove_dir(&p))?;
-        Dir::post_create_lookup(self.writable, &mut state, &path, name,
-            fuse::FileType::Directory, ids, cache)
+        Dir::post_create_lookup(self.writable, &mut state, &path, name, ids, cache)
     }
 
     fn mknod(&self, name: &OsStr, uid: unistd::Uid, gid: unistd::Gid, mode: u32, rdev: u32,
@@ -741,24 +730,12 @@ impl Node for Dir {
             (sflag, perm)
         };
 
-        let exp_filetype = match sflag {
-            sys::stat::SFlag::S_IFBLK => fuse::FileType::BlockDevice,
-            sys::stat::SFlag::S_IFCHR => fuse::FileType::CharDevice,
-            sys::stat::SFlag::S_IFIFO => fuse::FileType::NamedPipe,
-            sys::stat::SFlag::S_IFREG => fuse::FileType::RegularFile,
-            _ => {
-                warn!("mknod received request to create {} with type {:?}, which is not supported",
-                    path.display(), sflag);
-                return Err(KernelError::from_errno(errno::Errno::EIO));
-            },
-        };
-
         #[allow(clippy::cast_lossless)]
         create_as(
             &path, uid, gid,
             |p| sys::stat::mknod(p, sflag, perm, rdev as sys::stat::dev_t),
             |p| unistd::unlink(p))?;
-        Dir::post_create_lookup(self.writable, &mut state, &path, name, exp_filetype, ids, cache)
+        Dir::post_create_lookup(self.writable, &mut state, &path, name, ids, cache)
     }
 
     fn open(&self, flags: u32) -> NodeResult<ArcHandle> {
@@ -893,8 +870,7 @@ impl Node for Dir {
         let path = Dir::get_writable_path(&mut state, name)?;
 
         create_as(&path, uid, gid, |p| unix_fs::symlink(link, &p), |p| fs::remove_file(&p))?;
-        Dir::post_create_lookup(self.writable, &mut state, &path, name,
-            fuse::FileType::Symlink, ids, cache)
+        Dir::post_create_lookup(self.writable, &mut state, &path, name, ids, cache)
     }
 
     fn unlink(&self, name: &OsStr, cache: &dyn Cache) -> NodeResult<()> {

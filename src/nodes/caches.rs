@@ -24,7 +24,7 @@ pub struct NoCache {
 
 impl Cache for NoCache {
     fn get_or_create(&self, ids: &IdGenerator, underlying_path: &Path,
-        fs_type: fuse::FileType, attr: Option<&fs::Metadata>, writable: bool) -> ArcNode {
+        attr: Option<&fs::Metadata>, writable: bool) -> ArcNode {
         Dir::new_mapped(ids.next(), underlying_path, attr, writable)
     }
 
