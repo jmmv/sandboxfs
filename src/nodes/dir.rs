@@ -149,10 +149,21 @@ impl OpenDir {
             // of this code does the same and an attempt to "fix" this resulted in more complex
             // code and no visible performance gains.  That said, it'd be worth to investigate this
             // again.
-            let fs_attr = fs::symlink_metadata(&path)?;
-
-            let fs_type = conv::filetype_fs_to_fuse(&path, fs_attr.file_type());
-            let child = cache.get_or_create(ids, &path, &fs_attr, self.writable);
+            let (fs_type, fs_attr) = match entry.file_type() {
+                Some(nix::dir::Type::Fifo) => (fuse::FileType::NamedPipe, None),
+                Some(nix::dir::Type::CharacterDevice) => (fuse::FileType::CharDevice, None),
+                Some(nix::dir::Type::Directory) => (fuse::FileType::Directory, None),
+                Some(nix::dir::Type::BlockDevice) => (fuse::FileType::BlockDevice, None),
+                Some(nix::dir::Type::File) => (fuse::FileType::RegularFile, None),
+                Some(nix::dir::Type::Symlink) => (fuse::FileType::Symlink, None),
+                Some(nix::dir::Type::Socket) => (fuse::FileType::Socket, None),
+                None => {
+                    let fs_attr = fs::symlink_metadata(&path)?;
+                    let fs_type = conv::filetype_fs_to_fuse(&path, fs_attr.file_type());
+                    (fs_type, Some(fs_attr))
+                },
+            };
+            let child = cache.get_or_create(ids, &path, fs_type, fs_attr.as_ref(), self.writable);
 
             reply.push(ReplyEntry { inode: child.inode(), fs_type: fs_type, name: name.clone() });
 
@@ -385,7 +396,8 @@ impl Dir {
                 None => return Err(KernelError::from_errno(errno::Errno::ENOENT)),
             };
             let fs_attr = fs::symlink_metadata(&path)?;
-            let node = cache.get_or_create(ids, &path, &fs_attr, writable);
+            let fs_type = conv::filetype_fs_to_fuse(&path, fs_attr.file_type());
+            let node = cache.get_or_create(ids, &path, fs_type, Some(&fs_attr), writable);
             let attr = conv::attr_fs_to_fuse(
                 path.as_path(), node.inode(), node.getattr()?.nlink, &fs_attr);
             (node, attr)
@@ -548,7 +560,8 @@ impl Node for Dir {
         let child = if remainder.is_empty() {
             let fs_attr = fs::symlink_metadata(underlying_path)
                 .context(format!("Stat failed for {:?}", underlying_path))?;
-            cache.get_or_create(ids, underlying_path, &fs_attr, writable)
+            let fs_type = conv::filetype_fs_to_fuse(underlying_path, fs_attr.file_type());
+            cache.get_or_create(ids, underlying_path, fs_type, Some(&fs_attr), writable)
         } else {
             self.new_scaffold_child(state.underlying_path.as_ref(), name, ids, time::get_time())
         };

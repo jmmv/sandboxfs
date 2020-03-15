@@ -25,14 +25,14 @@ pub struct NoCache {
 }
 
 impl Cache for NoCache {
-    fn get_or_create(&self, ids: &IdGenerator, underlying_path: &Path, attr: &fs::Metadata,
-        writable: bool) -> ArcNode {
-        if attr.is_dir() {
-            Dir::new_mapped(ids.next(), underlying_path, Some(attr), writable)
-        } else if attr.file_type().is_symlink() {
-            Symlink::new_mapped(ids.next(), underlying_path, Some(attr), writable)
+    fn get_or_create(&self, ids: &IdGenerator, underlying_path: &Path,
+        fs_type: fuse::FileType, attr: Option<&fs::Metadata>, writable: bool) -> ArcNode {
+        if fs_type == fuse::FileType::Directory {
+            Dir::new_mapped(ids.next(), underlying_path, attr, writable)
+        } else if fs_type == fuse::FileType::Symlink {
+            Symlink::new_mapped(ids.next(), underlying_path, attr, writable)
         } else {
-            File::new_mapped(ids.next(), underlying_path, Some(attr), writable)
+            File::new_mapped(ids.next(), underlying_path, attr, writable)
         }
     }
 
@@ -73,15 +73,15 @@ pub struct PathCache {
 }
 
 impl Cache for PathCache {
-    fn get_or_create(&self, ids: &IdGenerator, underlying_path: &Path, attr: &fs::Metadata,
-        writable: bool) -> ArcNode {
-        if attr.is_dir() {
+    fn get_or_create(&self, ids: &IdGenerator, underlying_path: &Path, fs_type: fuse::FileType,
+        attr: Option<&fs::Metadata>, writable: bool) -> ArcNode {
+        if fs_type == fuse::FileType::Directory {
             // Directories cannot be cached because they contain entries that are created only
             // in memory based on the mappings configuration.
             //
             // TODO(jmmv): Actually, they *could* be cached, but it's hard.  Investigate doing so
             // after quantifying how much it may benefit performance.
-            return Dir::new_mapped(ids.next(), underlying_path, Some(attr), writable);
+            return Dir::new_mapped(ids.next(), underlying_path, attr, writable);
         }
 
         let mut entries = self.entries.lock().unwrap();
@@ -108,12 +108,12 @@ impl Cache for PathCache {
                 underlying_path)
         }
 
-        let node: ArcNode = if attr.is_dir() {
+        let node: ArcNode = if fs_type == fuse::FileType::Directory {
             panic!("Directory entries cannot be cached and are handled above");
-        } else if attr.file_type().is_symlink() {
-            Symlink::new_mapped(ids.next(), underlying_path, Some(attr), writable)
+        } else if fs_type == fuse::FileType::Symlink {
+            Symlink::new_mapped(ids.next(), underlying_path, attr, writable)
         } else {
-            File::new_mapped(ids.next(), underlying_path, Some(attr), writable)
+            File::new_mapped(ids.next(), underlying_path, attr, writable)
         };
         entries.insert(underlying_path.to_path_buf(), node.clone());
         node

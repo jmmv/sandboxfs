@@ -41,8 +41,8 @@ pub trait Cache {
     ///
     /// The returned node represents the given underlying path uniquely.  If creation is needed, the
     /// created node uses the given type and writable settings.
-    fn get_or_create(&self, _ids: &IdGenerator, _underlying_path: &Path, _attr: &fs::Metadata,
-        _writable: bool) -> ArcNode;
+    fn get_or_create(&self, _ids: &IdGenerator, _underlying_path: &Path, _fs_type: fuse::FileType,
+        _attr: Option<&fs::Metadata>, _writable: bool) -> ArcNode;
 
     /// Deletes the entry `path` from the cache.
     ///
