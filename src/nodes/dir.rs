@@ -220,7 +220,7 @@ pub struct Dir {
 pub struct MutableDir {
     parent: u64,
     underlying_path: Option<PathBuf>,
-    attr: fuse::FileAttr,
+    attr: Option<fuse::FileAttr>,
     children: HashMap<OsString, Dirent>,
 }
 
@@ -249,7 +249,7 @@ impl Dir {
         let state = MutableDir {
             parent: parent.map_or(inode, Node::inode),
             underlying_path: None,
-            attr: attr,
+            attr: Some(attr),
             children: HashMap::new(),
         };
 
@@ -269,12 +269,8 @@ impl Dir {
     /// `fs_attr` is an input parameter because, by the time we decide to instantiate a directory
     /// node (e.g. as we discover directory entries during readdir or lookup), we have already
     /// issued a stat on the underlying file system and we cannot re-do it for efficiency reasons.
-    pub fn new_mapped(inode: u64, underlying_path: &Path, fs_attr: &fs::Metadata, writable: bool)
-        -> ArcNode {
-        if !fs_attr.is_dir() {
-            panic!("Can only construct based on dirs");
-        }
-
+    pub fn new_mapped(inode: u64, underlying_path: &Path, fs_attr: Option<&fs::Metadata>,
+        writable: bool) -> ArcNode {
         // For directories, assume a fixed link count of 2 that does not change throughout the
         // lifetime of the directory (except for its own removal).
         //
@@ -285,7 +281,15 @@ impl Dir {
         // links (not just subdirectories).
         let nlink = 2;
 
-        let attr = conv::attr_fs_to_fuse(underlying_path, inode, nlink, &fs_attr);
+        let attr = match fs_attr {
+            Some(fs_attr) => {
+                if !fs_attr.is_dir() {
+                    panic!("Can only construct based on dirs");
+                }
+                Some(conv::attr_fs_to_fuse(underlying_path, inode, nlink, &fs_attr))
+            },
+            None => None,
+        };
 
         let state = MutableDir {
             parent: inode,
@@ -312,7 +316,8 @@ impl Dir {
             match fs::symlink_metadata(&child_path) {
                 Ok(fs_attr) => {
                     if fs_attr.is_dir() {
-                        return Dir::new_mapped(ids.next(), &child_path, &fs_attr, self.writable);
+                        return Dir::new_mapped(
+                            ids.next(), &child_path, Some(&fs_attr), self.writable);
                     }
 
                     info!("Mapping clobbers non-directory {} with an immutable directory",
@@ -337,10 +342,14 @@ impl Dir {
                     path.display(), fs_attr.file_type());
                 return Err(KernelError::from_errno(errno::Errno::EIO));
             }
-            state.attr = conv::attr_fs_to_fuse(path, inode, state.attr.nlink, &fs_attr);
+            let nlink = match state.attr {
+                Some(attr) => attr.nlink,
+                None => 2,
+            };
+            state.attr = Some(conv::attr_fs_to_fuse(path, inode, nlink, &fs_attr));
         }
 
-        Ok(state.attr)
+        Ok(state.attr.unwrap())
     }
 
     /// Gets the underlying path of the entry `name` in this directory.
@@ -473,14 +482,16 @@ impl Node for Dir {
         assert!(
             state.underlying_path.is_some(),
             "Delete already called or trying to delete an explicit mapping");
-        cache.delete(state.underlying_path.as_ref().unwrap(), state.attr.kind);
+        cache.delete(state.underlying_path.as_ref().unwrap(), fuse::FileType::Directory);
         state.underlying_path = None;
         // Make the hard link count for the directory be zero.  This is pretty much arbitrary as the
         // semantics for hard link counts on directories are not well defined, and thus different
         // OSes and file systems behave inconsistently.  For example, Linux's FUSE forces this to
         // zero, and macOS's APFS keeps this at 2.
-        debug_assert!(state.attr.nlink >= 2);
-        state.attr.nlink -= 2;
+        if let Some(attr) = state.attr.as_mut() {
+            debug_assert!(attr.nlink >= 2);
+            attr.nlink -= 2;
+        }
     }
 
     fn set_underlying_path(&self, path: &Path, cache: &dyn Cache) {
@@ -488,7 +499,7 @@ impl Node for Dir {
         debug_assert!(state.underlying_path.is_some(),
             "Renames should not have been allowed in scaffold or deleted nodes");
         cache.rename(
-            state.underlying_path.as_ref().unwrap(), path.to_owned(), state.attr.kind);
+            state.underlying_path.as_ref().unwrap(), path.to_owned(), fuse::FileType::Directory);
         state.underlying_path = Some(PathBuf::from(path));
 
         // This is racy: if other file operations are going on inside this subtree, they will fail
@@ -779,8 +790,8 @@ impl Node for Dir {
 
     fn setattr(&self, delta: &AttrDelta) -> NodeResult<fuse::FileAttr> {
         let mut state = self.state.lock().unwrap();
-        state.attr = setattr(state.underlying_path.as_ref(), &state.attr, delta)?;
-        Ok(state.attr)
+        state.attr = Some(setattr(state.underlying_path.as_ref(), &state.attr.unwrap(), delta)?);
+        Ok(state.attr.unwrap())
     }
 
     fn setxattr(&self, name: &OsStr, value: &[u8]) -> NodeResult<()> {

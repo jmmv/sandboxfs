@@ -28,11 +28,11 @@ impl Cache for NoCache {
     fn get_or_create(&self, ids: &IdGenerator, underlying_path: &Path, attr: &fs::Metadata,
         writable: bool) -> ArcNode {
         if attr.is_dir() {
-            Dir::new_mapped(ids.next(), underlying_path, attr, writable)
+            Dir::new_mapped(ids.next(), underlying_path, Some(attr), writable)
         } else if attr.file_type().is_symlink() {
-            Symlink::new_mapped(ids.next(), underlying_path, attr, writable)
+            Symlink::new_mapped(ids.next(), underlying_path, Some(attr), writable)
         } else {
-            File::new_mapped(ids.next(), underlying_path, attr, writable)
+            File::new_mapped(ids.next(), underlying_path, Some(attr), writable)
         }
     }
 
@@ -81,7 +81,7 @@ impl Cache for PathCache {
             //
             // TODO(jmmv): Actually, they *could* be cached, but it's hard.  Investigate doing so
             // after quantifying how much it may benefit performance.
-            return Dir::new_mapped(ids.next(), underlying_path, attr, writable);
+            return Dir::new_mapped(ids.next(), underlying_path, Some(attr), writable);
         }
 
         let mut entries = self.entries.lock().unwrap();
@@ -111,9 +111,9 @@ impl Cache for PathCache {
         let node: ArcNode = if attr.is_dir() {
             panic!("Directory entries cannot be cached and are handled above");
         } else if attr.file_type().is_symlink() {
-            Symlink::new_mapped(ids.next(), underlying_path, attr, writable)
+            Symlink::new_mapped(ids.next(), underlying_path, Some(attr), writable)
         } else {
-            File::new_mapped(ids.next(), underlying_path, attr, writable)
+            File::new_mapped(ids.next(), underlying_path, Some(attr), writable)
         };
         entries.insert(underlying_path.to_path_buf(), node.clone());
         node

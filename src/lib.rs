@@ -238,7 +238,8 @@ fn create_root(mappings: &[Mapping], ids: &IdGenerator, cache: &dyn nodes::Cache
                                  &first.underlying_path))?;
             ensure!(fs_attr.is_dir(), "Failed to map root: {:?} is not a directory",
                     &first.underlying_path);
-            (nodes::Dir::new_mapped(ids.next(), &first.underlying_path, &fs_attr, first.writable),
+            (nodes::Dir::new_mapped(
+                ids.next(), &first.underlying_path, Some(&fs_attr), first.writable),
                 &mappings[1..])
         } else {
             (nodes::Dir::new_empty(ids.next(), None, now), mappings)

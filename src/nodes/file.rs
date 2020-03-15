@@ -65,8 +65,9 @@ impl Handle for OpenFile {
         debug_assert!(n <= MAX_WRITE, "Size bounds checked above");
 
         let new_size = (offset as u64) + (n as u64);
-        if state.attr.size < new_size {
-            state.attr.size = new_size;
+        let mut attr = state.attr.as_mut().unwrap();
+        if attr.size < new_size {
+            attr.size = new_size;
         }
 
         Ok(n as u32)
@@ -86,7 +87,7 @@ pub struct File {
 /// Holds the mutable data of a file node.
 struct MutableFile {
     underlying_path: Option<PathBuf>,
-    attr: fuse::FileAttr,
+    attr: Option<fuse::FileAttr>,
 }
 
 impl File {
@@ -104,12 +105,17 @@ impl File {
     /// `fs_attr` is an input parameter because, by the time we decide to instantiate a file
     /// node (e.g. as we discover directory entries during readdir or lookup), we have already
     /// issued a stat on the underlying file system and we cannot re-do it for efficiency reasons.
-    pub fn new_mapped(inode: u64, underlying_path: &Path, fs_attr: &fs::Metadata, writable: bool)
-        -> ArcNode {
-        if !File::supports_type(fs_attr.file_type()) {
-            panic!("Can only construct based on non-directories / non-symlinks");
-        }
-        let attr = conv::attr_fs_to_fuse(underlying_path, inode, 1, &fs_attr);
+    pub fn new_mapped(inode: u64, underlying_path: &Path, fs_attr: Option<&fs::Metadata>,
+        writable: bool) -> ArcNode {
+        let attr = match fs_attr {
+            Some(fs_attr) => {
+                if !File::supports_type(fs_attr.file_type()) {
+                    panic!("Can only construct based on non-directories / non-symlinks");
+                }
+                Some(conv::attr_fs_to_fuse(underlying_path, inode, 1, &fs_attr))
+            },
+            None => None,
+        };
 
         let state = MutableFile {
             underlying_path: Some(PathBuf::from(underlying_path)),
@@ -128,10 +134,14 @@ impl File {
                     path.display(), fs_attr.file_type());
                 return Err(KernelError::from_errno(errno::Errno::EIO));
             }
-            state.attr = conv::attr_fs_to_fuse(path, inode, state.attr.nlink, &fs_attr);
+            let nlink = match state.attr {
+                Some(attr) => attr.nlink,
+                None => 1,
+            };
+            state.attr = Some(conv::attr_fs_to_fuse(path, inode, nlink, &fs_attr));
         }
 
-        Ok(state.attr)
+        Ok(state.attr.unwrap())
     }
 }
 
@@ -146,7 +156,7 @@ impl Node for File {
 
     fn file_type_cached(&self) -> fuse::FileType {
         let state = self.state.lock().unwrap();
-        state.attr.kind
+        state.attr.unwrap().kind
     }
 
     fn delete(&self, cache: &dyn Cache) {
@@ -154,18 +164,28 @@ impl Node for File {
         assert!(
             state.underlying_path.is_some(),
             "Delete already called or trying to delete an explicit mapping");
-        cache.delete(state.underlying_path.as_ref().unwrap(), state.attr.kind);
+        let kind = match state.attr {
+            Some(attr) => attr.kind,
+            None => fuse::FileType::RegularFile,
+        };
+        cache.delete(state.underlying_path.as_ref().unwrap(), kind);
         state.underlying_path = None;
-        debug_assert!(state.attr.nlink >= 1);
-        state.attr.nlink -= 1;
+        if let Some(attr) = state.attr.as_mut() {
+            debug_assert!(attr.nlink >= 1);
+            attr.nlink -= 1;
+        }
     }
 
     fn set_underlying_path(&self, path: &Path, cache: &dyn Cache) {
         let mut state = self.state.lock().unwrap();
         debug_assert!(state.underlying_path.is_some(),
             "Renames should not have been allowed in scaffold or deleted nodes");
+        let kind = match state.attr {
+            Some(attr) => attr.kind,
+            None => fuse::FileType::RegularFile,
+        };
         cache.rename(
-            state.underlying_path.as_ref().unwrap(), path.to_owned(), state.attr.kind);
+            state.underlying_path.as_ref().unwrap(), path.to_owned(), kind);
         state.underlying_path = Some(PathBuf::from(path));
     }
 
@@ -219,8 +239,8 @@ impl Node for File {
 
     fn setattr(&self, delta: &AttrDelta) -> NodeResult<fuse::FileAttr> {
         let mut state = self.state.lock().unwrap();
-        state.attr = setattr(state.underlying_path.as_ref(), &state.attr, delta)?;
-        Ok(state.attr)
+        state.attr = Some(setattr(state.underlying_path.as_ref(), &state.attr.unwrap(), delta)?);
+        Ok(state.attr.unwrap())
     }
 
     fn setxattr(&self, name: &OsStr, value: &[u8]) -> NodeResult<()> {
