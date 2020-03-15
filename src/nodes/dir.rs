@@ -24,7 +24,7 @@ use nodes::{
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{self as unix_fs, DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{self as unix_fs, DirBuilderExt, FileExt, OpenOptionsExt};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -213,6 +213,56 @@ impl Handle for OpenDir {
     }
 }
 
+/// Handle for an open file.
+struct OpenFile {
+    /// Reference to the node's state for this file.  Needed to update attributes on writes.
+    state: Arc<Mutex<MutableDir>>,
+
+    /// Handle for the open file descriptor.
+    file: fs::File,
+}
+
+impl OpenFile {
+    /// Creates a new handle that references the given node's `state` and the already-open `file`.
+    fn from(state: Arc<Mutex<MutableDir>>, file: fs::File) -> OpenFile {
+        Self { state, file }
+    }
+}
+
+impl Handle for OpenFile {
+    fn read(&self, offset: i64, size: u32) -> NodeResult<Vec<u8>> {
+        let mut buffer = vec![0; size as usize];
+        let n = self.file.read_at(&mut buffer[..size as usize], offset as u64)?;
+        buffer.truncate(n);
+        Ok(buffer)
+    }
+
+    fn write(&self, offset: i64, mut data: &[u8]) -> NodeResult<u32> {
+        const MAX_WRITE: usize = std::u32::MAX as usize;
+        if data.len() > MAX_WRITE {
+            // We only do this check because FUSE wants an u32 as the return value but data could
+            // theoretically be bigger.
+            // TODO(jmmv): Should fix the FUSE libraries to just expose Rust API-friendly quantities
+            // (usize in this case) and handle the kernel/Rust boundary internally.
+            warn!("Truncating too-long write to {} (asked for {} bytes)", MAX_WRITE, data.len());
+            data = &data[..MAX_WRITE];
+        }
+
+        let mut state = self.state.lock().unwrap();
+
+        let n = self.file.write_at(data, offset as u64)?;
+        debug_assert!(n <= MAX_WRITE, "Size bounds checked above");
+
+        let new_size = (offset as u64) + (n as u64);
+        let mut attr = state.attr.as_mut().unwrap();
+        if attr.size < new_size {
+            attr.size = new_size;
+        }
+
+        Ok(n as u32)
+    }
+}
+
 /// Representation of a directory entry.
 #[derive(Clone)]
 pub struct Dirent {
@@ -282,21 +332,21 @@ impl Dir {
     /// issued a stat on the underlying file system and we cannot re-do it for efficiency reasons.
     pub fn new_mapped(inode: u64, underlying_path: &Path, fs_attr: Option<&fs::Metadata>,
         writable: bool) -> ArcNode {
-        // For directories, assume a fixed link count of 2 that does not change throughout the
-        // lifetime of the directory (except for its own removal).
-        //
-        // An alternative would be to inherit the link count from the underlying file system and
-        // trust that it is accurate in the (typical) absence of hard links for directories.
-        // I tried that on 2020-02-10 on macOS Catalina with APFS and discovered that this
-        // assumption does not work because this system seems to count *all* directory entries as
-        // links (not just subdirectories).
-        let nlink = 2;
-
         let attr = match fs_attr {
             Some(fs_attr) => {
-                if !fs_attr.is_dir() {
-                    panic!("Can only construct based on dirs");
-                }
+                let nlink = if fs_attr.is_dir() {
+                    // For directories, assume a fixed link count of 2 that does not change throughout the
+                    // lifetime of the directory (except for its own removal).
+                    //
+                    // An alternative would be to inherit the link count from the underlying file system and
+                    // trust that it is accurate in the (typical) absence of hard links for directories.
+                    // I tried that on 2020-02-10 on macOS Catalina with APFS and discovered that this
+                    // assumption does not work because this system seems to count *all* directory entries as
+                    // links (not just subdirectories).
+                    2
+                } else {
+                    1
+                };
                 Some(conv::attr_fs_to_fuse(underlying_path, inode, nlink, &fs_attr))
             },
             None => None,
@@ -348,15 +398,11 @@ impl Dir {
     fn getattr_locked(inode: u64, state: &mut MutableDir) -> NodeResult<fuse::FileAttr> {
         if let Some(path) = &state.underlying_path {
             let fs_attr = fs::symlink_metadata(path)?;
-            if !fs_attr.is_dir() {
-                warn!("Path {} backing a directory node is no longer a directory; got {:?}",
-                    path.display(), fs_attr.file_type());
-                return Err(KernelError::from_errno(errno::Errno::EIO));
-            }
-            let nlink = match state.attr {
-                Some(attr) => attr.nlink,
-                None => 2,
-            };
+            let nlink = if fs_attr.is_dir() {
+                    2
+                } else {
+                    1
+                };
             state.attr = Some(conv::attr_fs_to_fuse(path, inode, nlink, &fs_attr));
         }
 
@@ -486,7 +532,8 @@ impl Node for Dir {
     }
 
     fn file_type_cached(&self) -> fuse::FileType {
-        fuse::FileType::Directory
+        let state = self.state.lock().unwrap();
+        state.attr.unwrap().kind
     }
 
     fn delete(&self, cache: &dyn Cache) {
@@ -501,8 +548,13 @@ impl Node for Dir {
         // OSes and file systems behave inconsistently.  For example, Linux's FUSE forces this to
         // zero, and macOS's APFS keeps this at 2.
         if let Some(attr) = state.attr.as_mut() {
-            debug_assert!(attr.nlink >= 2);
-            attr.nlink -= 2;
+            if attr.kind == fuse::FileType::Directory {
+                debug_assert!(attr.nlink >= 2);
+                attr.nlink -= 2;
+            } else {
+                debug_assert!(attr.nlink >= 1);
+                attr.nlink -= 1;
+            }
         }
     }
 
@@ -633,6 +685,10 @@ impl Node for Dir {
         }
     }
 
+    fn handle_from(&self, file: fs::File) -> ArcHandle {
+        Arc::from(OpenFile::from(self.state.clone(), file))
+    }
+
     fn listxattr(&self) -> NodeResult<Option<xattr::XAttrs>> {
         let state = self.state.lock().unwrap();
         match &state.underlying_path {
@@ -706,25 +762,41 @@ impl Node for Dir {
     }
 
     fn open(&self, flags: u32) -> NodeResult<ArcHandle> {
-        let flags = flags as i32;
-        let oflag = fcntl::OFlag::from_bits_truncate(flags);
+        let state = self.state.lock().unwrap();
 
-        let handle = {
-            let state = self.state.lock().unwrap();
+        if state.attr.unwrap().kind == fuse::FileType::Directory {
+            let flags = flags as i32;
+            let oflag = fcntl::OFlag::from_bits_truncate(flags);
 
-            match state.underlying_path.as_ref() {
-                Some(path) => Some(rawdir::Dir::open(path, oflag, sys::stat::Mode::S_IRUSR)?),
-                None => None,
-            }
-        };
+            let handle = {
+                match state.underlying_path.as_ref() {
+                    Some(path) => Some(rawdir::Dir::open(path, oflag, sys::stat::Mode::S_IRUSR)?),
+                    None => None,
+                }
+            };
 
-        Ok(Arc::from(OpenDir {
-            inode: self.inode,
-            writable: self.writable,
-            state: self.state.clone(),
-            handle: Mutex::from(handle),
-            reply_contents: Mutex::from(vec!()),
-        }))
+            Ok(Arc::from(OpenDir {
+                inode: self.inode,
+                writable: self.writable,
+                state: self.state.clone(),
+                handle: Mutex::from(handle),
+                reply_contents: Mutex::from(vec!()),
+            }))
+        } else {
+            let options = conv::flags_to_openoptions(flags, self.writable)?;
+            let path = state.underlying_path.as_ref().expect(
+                "Don't know how to handle a request to reopen a deleted file");
+            let file = options.open(&path)?;
+            Ok(Arc::from(OpenFile::from(self.state.clone(), file)))
+        }
+    }
+
+    fn readlink(&self) -> NodeResult<PathBuf> {
+        let state = self.state.lock().unwrap();
+
+        let path = state.underlying_path.as_ref().expect(
+            "There is no known API to get the target of a deleted symlink");
+        Ok(fs::read_link(path)?)
     }
 
     fn removexattr(&self, name: &OsStr) -> NodeResult<()> {

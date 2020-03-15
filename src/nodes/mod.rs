@@ -30,10 +30,6 @@ pub use self::caches::{NoCache, PathCache};
 pub mod conv;
 mod dir;
 pub use self::dir::Dir;
-mod file;
-pub use self::file::File;
-mod symlink;
-pub use self::symlink::Symlink;
 
 /// Node factory with possible reuse of previously-created nodes.
 pub trait Cache {
