@@ -213,7 +213,7 @@ fn split_abs_path(path: &Path) -> Vec<Component> {
 /// This code is shared by the application of `--mapping` flags and by the application of new
 /// mappings as part of a reconfiguration operation.  We want both processes to behave identically.
 fn apply_mapping(mapping: &Mapping, root: &dyn nodes::Node, ids: &IdGenerator,
-    cache: &dyn nodes::Cache) -> Fallible<nodes::ArcNode> {
+    cache: &dyn nodes::Cache) -> Fallible<()> {
     let components = split_abs_path(&mapping.path);
 
     // The input `root` node is an existing node that corresponds to the root.  If we don't find
@@ -793,12 +793,11 @@ impl reconfig::ReconfigurableFS for ReconfigurableSandboxFS {
                     let m = Mapping::from_parts(
                         path, mapping.underlying_path.clone(), mapping.writable)?;
                     apply_mapping(&m, self.root.as_ref(), self.ids.as_ref(), self.cache.as_ref())
-                        .context(format!("Cannot map '{}'", mapping))?
-                } else {
-                    self.root.find_subdir(OsStr::new(id), self.ids.as_ref())?
+                        .context(format!("Cannot map '{}'", mapping))?;
                 }
+                self.root.find_subdir(OsStr::new(id), self.ids.as_ref(), self.cache.as_ref())?
             },
-            None => self.root.find_subdir(OsStr::new(id), self.ids.as_ref())?,
+            None => self.root.find_subdir(OsStr::new(id), self.ids.as_ref(), self.cache.as_ref())?,
         };
 
         // TODO(jmmv): Even though we don't hold the root lock any longer, this *still* is very

@@ -316,13 +316,12 @@ pub trait Node {
     ///
     /// `_ids` and `_cache` are the file system-wide bookkeeping objects needed to instantiate new
     /// nodes, used when this algorithm instantiates any new node.
-    fn find_subdir(&self, _name: &OsStr, _ids: &IdGenerator) -> Fallible<ArcNode> {
+    fn find_subdir(&self, _name: &OsStr, _ids: &IdGenerator, _cache: &dyn Cache)
+        -> Fallible<ArcNode> {
         panic!("Not implemented")
     }
 
     /// Maps a path onto a node and creates intermediate components as immutable directories.
-    ///
-    /// Returns the newly-created node.
     ///
     /// `_components` is the path to map, broken down into components, and relative to the current
     /// node.  `_underlying_path` is the target to use for the created node.  `_writable` indicates
@@ -331,7 +330,7 @@ pub trait Node {
     /// `_ids` and `_cache` are the file system-wide bookkeeping objects needed to instantiate new
     /// nodes, used when this algorithm instantiates any new node.
     fn map(&self, _components: &[Component], _underlying_path: &Path, _writable: bool,
-        _ids: &IdGenerator, _cache: &dyn Cache) -> Fallible<ArcNode> {
+        _ids: &IdGenerator, _cache: &dyn Cache) -> Fallible<()> {
         panic!("Not implemented")
     }
 
@@ -483,7 +482,7 @@ pub trait Node {
     ///
     /// `_cache` is the file system-wide bookkeeping object that caches underlying paths to nodes,
     /// which needs to be update to account for the node rename.
-    fn rename_and_move_target(&self, _dirent: &dir::Dirent, _old_path: &Path, _new_name: &OsStr,
+    fn rename_and_move_target(&self, _dirent: &mut dir::Dirent, _old_path: &Path, _new_name: &OsStr,
         _cache: &dyn Cache) -> NodeResult<()> {
         Err(KernelError::from_errno(Errno::ENOTDIR))
     }

@@ -16,7 +16,7 @@ extern crate fuse;
 extern crate time;
 
 use {create_as, IdGenerator};
-use failure::{Fallible, ResultExt};
+use failure::Fallible;
 use nix::{errno, fcntl, sys, unistd};
 use nix::dir as rawdir;
 use nodes::{
@@ -98,11 +98,12 @@ impl OpenDir {
         // either mount time or during a reconfiguration.  Those should clobber any on-disk
         // contents that we discover later when we issue the readdir on the underlying directory,
         // if any.
-        for (name, dirent) in &state.children {
+        for (name, dirent) in &mut state.children {
             if dirent.explicit_mapping {
+                let child = dirent.get_node(ids, cache)?;
                 reply.push(ReplyEntry {
-                    inode: dirent.node.inode(),
-                    fs_type: dirent.node.file_type_cached(),
+                    inode: child.inode(),
+                    fs_type: child.file_type_cached(),
                     name: name.clone()
                 });
             }
@@ -126,15 +127,16 @@ impl OpenDir {
                 continue;
             }
 
-            if let Some(dirent) = state.children.get(&name) {
+            if let Some(dirent) = state.children.get_mut(&name) {
                 // Found a previously-known on-disk entry.  Must return it "as is" (even if its
                 // type might have changed) because, if we called into `cache.get_or_create` below,
                 // we might recreate the node unintentionally.  Note that mappings were handled
                 // earlier, so only handle the non-mapping case here.
                 if !dirent.explicit_mapping {
+                    let child = dirent.get_node(ids, cache)?;
                     reply.push(ReplyEntry {
-                        inode: dirent.node.inode(),
-                        fs_type: dirent.node.file_type_cached(),
+                        inode: child.inode(),
+                        fs_type: child.file_type_cached(),
                         name: name.clone(),
                     });
                 }
@@ -159,8 +161,10 @@ impl OpenDir {
             // Do the insertion into state.children after calling reply.add() to be able to move
             // the name into the key without having to copy it again.
             let dirent = Dirent {
-                node: child.clone(),
+                node: Some(child.clone()),
                 explicit_mapping: false,
+                underlying_path: PathBuf::new(),
+                writable: self.writable,
             };
             // TODO(jmmv): We should remove stale entries at some point (possibly here), but the Go
             // variant does not do this so any implications of this are not tested.  The reason this
@@ -205,8 +209,44 @@ impl Handle for OpenDir {
 /// Representation of a directory entry.
 #[derive(Clone)]
 pub struct Dirent {
-    node: ArcNode,
+    node: Option<ArcNode>,
     explicit_mapping: bool,
+
+    underlying_path: PathBuf,
+    writable: bool,
+}
+
+impl Dirent {
+    pub fn delete(&mut self, cache: &dyn Cache) {
+        match &self.node {
+            Some(node) => node.delete(cache),
+            None => (),
+        }
+    }
+
+    pub fn unmap(&mut self, inodes: &mut Vec<u64>) -> Fallible<()> {
+        match &self.node {
+            Some(node) => node.unmap(inodes),
+            None => Ok(()),
+        }
+    }
+
+    pub fn set_underlying_path(&mut self, underlying_path: PathBuf, cache: &dyn Cache) {
+        match &self.node {
+            Some(node) => node.set_underlying_path(&underlying_path, cache),
+            None => self.underlying_path = underlying_path,
+        }
+    }
+
+    pub fn get_node(&mut self, ids: &IdGenerator, cache: &dyn Cache) -> NodeResult<&ArcNode> {
+        if self.node.is_none() {
+            let fs_attr = fs::symlink_metadata(&self.underlying_path)?;
+            self.node = Some(
+                cache.get_or_create(ids, &self.underlying_path, &fs_attr, self.writable));
+            self.underlying_path = PathBuf::new();
+        }
+        Ok(self.node.as_ref().unwrap())
+    }
 }
 
 /// Representation of a directory node.
@@ -365,9 +405,10 @@ impl Dir {
     // Same as `lookup` but with the node already locked.
     fn lookup_locked(writable: bool, state: &mut MutableDir, name: &OsStr, ids: &IdGenerator,
         cache: &dyn Cache) -> NodeResult<(ArcNode, fuse::FileAttr)> {
-        if let Some(dirent) = state.children.get(name) {
-            let refreshed_attr = dirent.node.getattr()?;
-            return Ok((dirent.node.clone(), refreshed_attr))
+        if let Some(dirent) = state.children.get_mut(name) {
+            let child = dirent.get_node(ids, cache)?;
+            let refreshed_attr = child.getattr()?;
+            return Ok((child.clone(), refreshed_attr))
         }
 
         let (child, attr) = {
@@ -382,8 +423,10 @@ impl Dir {
             (node, attr)
         };
         let dirent = Dirent {
-            node: child.clone(),
+            node: Some(child.clone()),
             explicit_mapping: false,
+            underlying_path: PathBuf::new(),
+            writable: writable,
         };
         state.children.insert(name.to_os_string(), dirent);
         Ok((child, attr))
@@ -448,9 +491,9 @@ impl Dir {
         // because different lookups on different nodes could still race against the cache state.
         // We don't bother for now though: the Rust FUSE library serializes all requests so this
         // situation cannot arise.
-        let entry = state.children.remove(name)
+        let mut entry = state.children.remove(name)
             .expect("Presence guaranteed by get_writable_path call above");
-        entry.node.delete(cache);
+        entry.delete(cache);
         Ok(())
     }
 }
@@ -495,22 +538,27 @@ impl Node for Dir {
         // with ENOENT until we have updated their underlying paths after the move.  However, as we
         // are currently single-threaded (because the Rust FUSE bindings don't support multiple
         // threads), we are fine.
-        for (name, dirent) in &state.children {
-            dirent.node.set_underlying_path(&path.join(name), cache);
+        for (name, dirent) in &mut state.children {
+            dirent.set_underlying_path(path.join(name), cache);
         }
     }
 
-    fn find_subdir(&self, name: &OsStr, ids: &IdGenerator) -> Fallible<ArcNode> {
+    fn find_subdir(&self, name: &OsStr, ids: &IdGenerator, cache: &dyn Cache) -> Fallible<ArcNode> {
         let mut state = self.state.lock().unwrap();
 
-        match state.children.get(name) {
+        match state.children.get_mut(name) {
             Some(dirent) => {
                 ensure!(dirent.explicit_mapping, "Not a mapping");
-                Ok(dirent.node.clone())
+                Ok(dirent.get_node(ids, cache)?.clone())
             },
             None => {
                 let child = self.new_scaffold_child(None, name, ids, time::get_time());
-                let dirent = Dirent { node: child.clone(), explicit_mapping: true };
+                let dirent = Dirent {
+                    node: Some(child.clone()),
+                    explicit_mapping: true,
+                    underlying_path: PathBuf::new(),
+                    writable: false
+                };
                 state.children.insert(name.to_os_string(), dirent);
                 Ok(child)
             },
@@ -518,7 +566,7 @@ impl Node for Dir {
     }
 
     fn map(&self, components: &[Component], underlying_path: &Path, writable: bool,
-        ids: &IdGenerator, cache: &dyn Cache) -> Fallible<ArcNode> {
+        ids: &IdGenerator, cache: &dyn Cache) -> Fallible<()> {
         debug_assert!(
             !components.is_empty(),
             "Must not be reached because we don't have the containing ArcNode to return it");
@@ -526,28 +574,37 @@ impl Node for Dir {
 
         let mut state = self.state.lock().unwrap();
 
-        if let Some(dirent) = state.children.get(name) {
+        if let Some(dirent) = state.children.get_mut(name) {
             // TODO(jmmv): We should probably mark this dirent as an explicit mapping if it already
             // wasn't, but the Go variant of this code doesn't do this -- so investigate later.
-            ensure!(dirent.node.file_type_cached() == fuse::FileType::Directory
+            let child = dirent.get_node(ids, cache)?;
+            ensure!(child.file_type_cached() == fuse::FileType::Directory
                 && !remainder.is_empty(), "Already mapped");
-            return dirent.node.map(remainder, underlying_path, writable, ids, cache);
+            return child.map(remainder, underlying_path, writable, ids, cache);
         }
 
-        let child = if remainder.is_empty() {
-            let fs_attr = fs::symlink_metadata(underlying_path)
-                .context(format!("Stat failed for {:?}", underlying_path))?;
-            cache.get_or_create(ids, underlying_path, &fs_attr, writable)
-        } else {
-            self.new_scaffold_child(state.underlying_path.as_ref(), name, ids, time::get_time())
-        };
-
-        let dirent = Dirent { node: child.clone(), explicit_mapping: true };
-        state.children.insert(name.to_os_string(), dirent);
-
         if remainder.is_empty() {
-            Ok(child)
+            let dirent = Dirent {
+                node: None,
+                explicit_mapping: true,
+                underlying_path: underlying_path.to_owned(),
+                writable: writable
+            };
+            state.children.insert(name.to_os_string(), dirent);
+
+            Ok(())
         } else {
+            let child = self.new_scaffold_child(
+                state.underlying_path.as_ref(), name, ids, time::get_time());
+
+                let dirent = Dirent {
+                node: Some(child.clone()),
+                explicit_mapping: true,
+                underlying_path: PathBuf::new(),
+                writable: false,
+            };
+            state.children.insert(name.to_os_string(), dirent);
+
             ensure!(child.file_type_cached() == fuse::FileType::Directory, "Already mapped");
             child.map(remainder, underlying_path, writable, ids, cache)
         }
@@ -555,8 +612,8 @@ impl Node for Dir {
 
     fn unmap(&self, inodes: &mut Vec<u64>) -> Fallible<()> {
         let mut state = self.state.lock().unwrap();
-        for dirent in state.children.values() {
-            dirent.node.unmap(inodes)?;
+        for dirent in state.children.values_mut() {
+            dirent.unmap(inodes)?;
         }
         state.children.clear();
 
@@ -567,9 +624,9 @@ impl Node for Dir {
     fn unmap_subdir(&self, name: &OsStr, inodes: &mut Vec<u64>) -> Fallible<()> {
         let mut state = self.state.lock().unwrap();
         match state.children.remove_entry(name) {
-            Some((name, dirent)) => {
+            Some((name, mut dirent)) => {
                 if dirent.explicit_mapping {
-                    dirent.node.unmap(inodes)
+                    dirent.unmap(inodes)
                 } else {
                     let err = format_err!("{:?} is not a mapping", &name);
                     state.children.insert(name, dirent);
@@ -719,9 +776,9 @@ impl Node for Dir {
 
         fs::rename(&old_path, &new_path)?;
 
-        let dirent = state.children.remove(old_name)
+        let mut dirent = state.children.remove(old_name)
             .expect("get_writable_path call above ensured the child exists");
-        dirent.node.set_underlying_path(&new_path, cache);
+        dirent.set_underlying_path(new_path, cache);
         state.children.insert(new_name.to_owned(), dirent);
         Ok(())
     }
@@ -735,9 +792,9 @@ impl Node for Dir {
 
         let old_path = Dir::get_writable_path(&mut state, old_name)?;
 
-        let (old_name, dirent) = state.children.remove_entry(old_name)
+        let (old_name, mut dirent) = state.children.remove_entry(old_name)
             .expect("get_writable_path call above ensured the child exists");
-        let result = new_dir.rename_and_move_target(&dirent, &old_path, new_name, cache);
+        let result = new_dir.rename_and_move_target(&mut dirent, &old_path, new_name, cache);
         if result.is_err() {
             // "Roll back" any changes we did to the current directory because the rename could not
             // be completed on the target.
@@ -746,7 +803,7 @@ impl Node for Dir {
         result
     }
 
-    fn rename_and_move_target(&self, dirent: &Dirent, old_path: &Path, new_name: &OsStr,
+    fn rename_and_move_target(&self, dirent: &mut Dirent, old_path: &Path, new_name: &OsStr,
         cache: &dyn Cache) -> NodeResult<()> {
         // We are locking the target node while the source node is already locked, so this can
         // deadlock.  The previous Go implementation of this code ordered the locks based on inode
@@ -766,7 +823,7 @@ impl Node for Dir {
 
         fs::rename(&old_path, &new_path)?;
 
-        dirent.node.set_underlying_path(&new_path, cache);
+        dirent.set_underlying_path(new_path, cache);
         state.children.insert(new_name.to_owned(), dirent.clone());
         Ok(())
     }
